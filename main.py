@@ -72,15 +72,20 @@ else:
 
 # Limits & prompts
 MAX_TEXT_LENGTH      = 4000
-MAX_FILE_SIZE        = 10 * 1024 * 1024
+MAX_FILE_SIZE        = 20 * 1024 * 1024
 MAX_PDF_TEXT_LENGTH  = 10000
-MAX_IMAGE_SIZE       = 5 * 1024 * 1024
+MAX_IMAGE_SIZE       = 10 * 1024 * 1024
 MAX_REQUESTS_PER_MIN  = 3
 REQUEST_TIMEOUT      = 300
 MAX_CONCURRENT_REQS  = 10
 
-IMAGE_PROMPT         = "What does this image show? Provide a brief analysis focusing on key elements."
-PDF_PROMPT           = "Summarize this document concisely, focusing on main points."
+UNIFIED_PROMPT = """Please analyze this content and provide a structured response with the following sections:
+1. Content Type: What type of content is this? (e.g., image, PDF, document)
+2. Key Details: What are the main elements, text, or numbers visible? Limit to 3 lines
+3. Context: What is the overall context or purpose?
+4. Analysis: What are the key takeaways? (If medical, explain in layman's terms)
+
+Please keep the response concise and easy to understand."""
 
 # Thread‑safe rate/concurrency tracker
 class RequestTracker:
@@ -209,7 +214,9 @@ async def handle_message(update, context):
             bio = BytesIO()
             await file.download_to_memory(bio)
             img_bytes = bio.getvalue()
-            prompt = msg.caption or IMAGE_PROMPT
+            prompt = msg.caption if msg.caption else UNIFIED_PROMPT
+            if not msg.caption:
+                await msg.reply_text("Analyzing the image...Please wait for a minute.")
 
         elif msg.document:
             doc = msg.document
@@ -231,18 +238,32 @@ async def handle_message(update, context):
                         if len(text) > MAX_PDF_TEXT_LENGTH:
                             text = text[:MAX_PDF_TEXT_LENGTH]
                             break
-                    prompt = (msg.caption or PDF_PROMPT) + "\n\n" + text
-                except Exception:
-                    await msg.reply_text("Couldn't read this PDF.")
+                    
+                    # If no text was extracted, treat it as an image-based PDF
+                    if not text.strip():
+                        logger.info("No text extracted from PDF, treating as image-based PDF")
+                        img_bytes = data
+                        prompt = msg.caption if msg.caption else UNIFIED_PROMPT
+                        if not msg.caption:
+                            await msg.reply_text("Analyzing the image-based PDF...Please wait for a minute.")
+                    else:
+                        prompt = (msg.caption if msg.caption else UNIFIED_PROMPT) + "\n\n" + text
+                        if not msg.caption:
+                            await msg.reply_text("Analyzing the PDF document...Please wait for a minute.")
+                except Exception as e:
+                    logger.error(f"PDF processing error: {e}", exc_info=True)
+                    await msg.reply_text("Couldn't read this PDF. Please make sure it's not password protected and contains readable text.")
                     return
             elif doc.mime_type in ('image/jpeg','image/png'):
                 if len(data) > MAX_IMAGE_SIZE:
                     await msg.reply_text("Image too large.")
                     return
                 img_bytes = data
-                prompt = msg.caption or IMAGE_PROMPT
+                prompt = msg.caption if msg.caption else UNIFIED_PROMPT
+                if not msg.caption:
+                    await msg.reply_text("Analyzing the image...Please wait for a minute.")
             else:
-                await msg.reply_text(f"Unsupported MIME: {doc.mime_type}")
+                await msg.reply_text(f"Unsupported file type: {doc.mime_type}. Please send a PDF or image file.")
                 return
 
         else:
@@ -254,7 +275,7 @@ async def handle_message(update, context):
 
         await context.bot.send_chat_action(cid, "typing")
         ai_text = await get_ai_response(prompt, img_bytes)
-        final = f"{ai_text}\n\n— Forward to a friend if unclear."
+        final = f"{ai_text}\n\n— Still unclear? Ask Ankit"
 
         # split into 4096‐char chunks
         for i in range(0, len(final), 4096):
